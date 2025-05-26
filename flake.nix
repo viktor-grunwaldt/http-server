@@ -2,7 +2,7 @@
   description = "Build a cargo project without extra checks";
 
   inputs = {
-    nixpkgs.url = "nixpkgs/nixos-24.11";
+    nixpkgs.url = "nixpkgs/nixos-25.05";
     crane.url = "github:ipetkov/crane";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
@@ -27,7 +27,13 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
-        craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.rust-bin.stable."1.63.0".default);
+        rust-version = "1.64.0";
+        craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.rust-bin.stable.${rust-version}.default.override {
+          extensions = [
+            "rust-src"
+            "rust-analyzer"
+          ];
+        });
 
         # Common arguments can be set here to avoid repeating them later
         # Note: changes here will rebuild all dependency crates
@@ -77,7 +83,7 @@
           # Extra inputs can be added here; cargo and rustc are provided by default.
           packages = [
             # pkgs.ripgrep
-            pkgs.rust-analyzer
+            # pkgs.rust-analyzer
           ];
         };
       }
