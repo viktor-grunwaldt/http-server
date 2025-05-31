@@ -6,6 +6,14 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4, TcpStream},
     path::{Path, PathBuf},
 };
+
+enum Status {
+    InternalServerError,
+    PageNotFound,
+    Forbidden,
+    Success,
+}
+
 fn e_to_cow(p: &Path, e: std::io::Error) -> Cow<'static, [u8]> {
     eprintln!("Error reading file {}: {}", p.display(), e);
     let status_line = "HTTP/1.1 500 Internal Server Error";
@@ -17,6 +25,45 @@ fn e_to_cow(p: &Path, e: std::io::Error) -> Cow<'static, [u8]> {
     );
     Cow::Owned(msg.into_bytes())
 }
+fn build_response_other(ext: &str, p: &Path) -> Cow<'static, [u8]> {
+    // Attempt to guess the Content-Type based on the extension
+    let content_type = match ext.to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "css" => "text/css",
+        "js" => "application/javascript",
+        "txt" => "text/plain",
+        "bin" => "application/octet-stream", // Generic binary
+        _ => "application/octet-stream",     // Default for unknown
+    };
+
+    let status_line = "HTTP/1.1 200 OK";
+    match fs::read(p) {
+        // Read file as bytes
+        Ok(file_bytes) => {
+            let len = file_bytes.len();
+            // Headers must be ASCII, so no charset for binary files
+            let headers = format!(
+                "Content-Type: {}\r\nContent-Length: {}\r\n\r\n",
+                content_type, len
+            );
+            let mut response_bytes =
+                Vec::with_capacity(status_line.len() + 2 + headers.len() + file_bytes.len());
+            response_bytes.extend_from_slice(status_line.as_bytes());
+            response_bytes.extend_from_slice(b"\r\n");
+            response_bytes.extend_from_slice(headers.as_bytes());
+            response_bytes.extend_from_slice(&file_bytes);
+            Cow::Owned(response_bytes)
+        }
+        Err(e) => e_to_cow(p, e),
+    }
+}
+
 fn handle_request(p: &Path) -> Cow<'static, [u8]> {
     let response: Cow<'static, [u8]> = match p.extension().and_then(|ext| ext.to_str()) {
         Some("html") => {
@@ -30,45 +77,7 @@ fn handle_request(p: &Path) -> Cow<'static, [u8]> {
                 Err(e) => e_to_cow(p, e),
             }
         }
-        Some(ext) => {
-            // Attempt to guess the Content-Type based on the extension
-            let content_type = match ext.to_lowercase().as_str() {
-                "png" => "image/png",
-                "jpg" | "jpeg" => "image/jpeg",
-                "gif" => "image/gif",
-                "svg" => "image/svg+xml",
-                "pdf" => "application/pdf",
-                "json" => "application/json",
-                "xml" => "application/xml",
-                "css" => "text/css",
-                "js" => "application/javascript",
-                "txt" => "text/plain",
-                "bin" => "application/octet-stream", // Generic binary
-                _ => "application/octet-stream",     // Default for unknown
-            };
-
-            let status_line = "HTTP/1.1 200 OK";
-            match fs::read(p) {
-                // Read file as bytes
-                Ok(file_bytes) => {
-                    let len = file_bytes.len();
-                    // Headers must be ASCII, so no charset for binary files
-                    let headers = format!(
-                        "Content-Type: {}\r\nContent-Length: {}\r\n\r\n",
-                        content_type, len
-                    );
-                    let mut response_bytes = Vec::with_capacity(
-                        status_line.len() + 2 + headers.len() + file_bytes.len(),
-                    );
-                    response_bytes.extend_from_slice(status_line.as_bytes());
-                    response_bytes.extend_from_slice(b"\r\n");
-                    response_bytes.extend_from_slice(headers.as_bytes());
-                    response_bytes.extend_from_slice(&file_bytes);
-                    Cow::Owned(response_bytes)
-                }
-                Err(e) => e_to_cow(p, e),
-            }
-        }
+        Some(ext) => build_response_other(ext, p),
         _ => {
             // No extension or unhandled extension, default to 404 Not Found or a simple text response.
             // For simplicity, let's treat it as a 404 for now.
