@@ -1,9 +1,10 @@
 use std::{
     borrow::Cow,
+    env::{self, Args},
     fs,
     io::{BufRead, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
 };
 fn e_to_cow(p: &Path, e: std::io::Error) -> Cow<'static, [u8]> {
     eprintln!("Error reading file {}: {}", p.display(), e);
@@ -85,7 +86,7 @@ fn handle_request(p: &Path) -> Cow<'static, [u8]> {
     response
 }
 
-fn handle_connection(mut stream: TcpStream) {
+fn handle_connection(files: &Path, mut stream: TcpStream) {
     let mut rdr = std::io::BufReader::new(&mut stream);
     let mut l = String::new();
     rdr.read_line(&mut l).unwrap();
@@ -99,7 +100,7 @@ fn handle_connection(mut stream: TcpStream) {
             #[cfg(debug_assertions)]
             println!("{:?}", remainder);
             let mut p = std::path::PathBuf::new();
-            p.push("webpages");
+            p.push(&files);
             p.push(resource.trim_start_matches("/"));
             if resource.ends_with('/') {
                 p.push("index.html");
@@ -111,10 +112,30 @@ fn handle_connection(mut stream: TcpStream) {
         _ => todo!(),
     }
 }
-
+struct ProgArgs {
+    port: u16,
+    directory: PathBuf,
+}
+fn parse_args(mut args: Args) -> Option<ProgArgs> {
+    let _name = args.next()?;
+    let port = args.next()?.parse().ok()?;
+    let directory = args.next()?.parse().ok()?;
+    Some(ProgArgs { port, directory })
+}
 fn main() {
-    let saddr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8888);
+    let args = match parse_args(env::args()) {
+        Some(x) => x,
+        None => {
+            eprintln!("usage: http_server [port] [directory]");
+            std::process::exit(1);
+        }
+    };
+
+    let saddr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 1, 1), args.port);
     println!("listening on address: http://{}", saddr);
     let listener = std::net::TcpListener::bind(saddr).unwrap();
-    listener.incoming().flatten().for_each(handle_connection);
+    listener
+        .incoming()
+        .flatten()
+        .for_each(|s| handle_connection(&args.directory, s));
 }
