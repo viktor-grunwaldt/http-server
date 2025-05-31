@@ -14,17 +14,46 @@ enum Status {
     Success,
 }
 
+fn build_http_response(
+    status: Status,
+    content_type: &str,
+    body: Cow<'static, [u8]>,
+) -> Cow<'static, [u8]> {
+    let (status_line_str, _) = match status {
+        Status::Success => ("200 OK", "OK"),
+        Status::PageNotFound => ("404 Not Found", "Not Found"),
+        Status::Forbidden => ("403 Forbidden", "Forbidden"),
+        Status::InternalServerError => ("500 Internal Server Error", "Internal Server Error"),
+    };
+
+    let full_status_line = format!("HTTP/1.1 {}", status_line_str);
+    let len = body.len();
+
+    let headers = format!(
+        "Content-Type: {}\r\nContent-Length: {}\r\n\r\n",
+        content_type, len
+    );
+
+    let mut response_bytes =
+        Vec::with_capacity(full_status_line.len() + 2 + headers.len() + body.len());
+    response_bytes.extend_from_slice(full_status_line.as_bytes());
+    response_bytes.extend_from_slice(b"\r\n"); // CRLF after status line
+    response_bytes.extend_from_slice(headers.as_bytes());
+    response_bytes.extend_from_slice(&body);
+
+    Cow::Owned(response_bytes)
+}
+
 fn e_to_cow(p: &Path, e: std::io::Error) -> Cow<'static, [u8]> {
     eprintln!("Error reading file {}: {}", p.display(), e);
-    let status_line = "HTTP/1.1 500 Internal Server Error";
     let body = format!("Server error: {}", e);
-    let msg = format!(
-        "{status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    Cow::Owned(msg.into_bytes())
+    build_http_response(
+        Status::InternalServerError,
+        "text/plain; charset=utf-8",
+        Cow::Owned(body.into_bytes()),
+    )
 }
+
 fn build_response_other(ext: &str, p: &Path) -> Cow<'static, [u8]> {
     // Attempt to guess the Content-Type based on the extension
     let content_type = match ext.to_lowercase().as_str() {
@@ -37,62 +66,41 @@ fn build_response_other(ext: &str, p: &Path) -> Cow<'static, [u8]> {
         "xml" => "application/xml",
         "css" => "text/css",
         "js" => "application/javascript",
-        "txt" => "text/plain",
+        "txt" => "text/plain; charset=utf-8",
         "bin" => "application/octet-stream", // Generic binary
         _ => "application/octet-stream",     // Default for unknown
     };
 
-    let status_line = "HTTP/1.1 200 OK";
     match fs::read(p) {
         // Read file as bytes
         Ok(file_bytes) => {
-            let len = file_bytes.len();
-            // Headers must be ASCII, so no charset for binary files
-            let headers = format!(
-                "Content-Type: {}\r\nContent-Length: {}\r\n\r\n",
-                content_type, len
-            );
-            let mut response_bytes =
-                Vec::with_capacity(status_line.len() + 2 + headers.len() + file_bytes.len());
-            response_bytes.extend_from_slice(status_line.as_bytes());
-            response_bytes.extend_from_slice(b"\r\n");
-            response_bytes.extend_from_slice(headers.as_bytes());
-            response_bytes.extend_from_slice(&file_bytes);
-            Cow::Owned(response_bytes)
+            build_http_response(Status::Success, content_type, Cow::Owned(file_bytes))
         }
         Err(e) => e_to_cow(p, e),
     }
 }
 
 fn handle_request(p: &Path) -> Cow<'static, [u8]> {
-    let response: Cow<'static, [u8]> = match p.extension().and_then(|ext| ext.to_str()) {
-        Some("html") => {
-            let status_line = "HTTP/1.1 200 OK";
-            match fs::read_to_string(p) {
-                Ok(file_content) => {
-                    let len = file_content.len();
-                    let msg = format!("{status_line}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len}\r\n\r\n{file_content}");
-                    Cow::Owned(msg.into_bytes())
-                }
-                Err(e) => e_to_cow(p, e),
-            }
-        }
+    match p.extension().and_then(|ext| ext.to_str()) {
+        Some("html") => match fs::read_to_string(p) {
+            Ok(file_content) => build_http_response(
+                Status::Success,
+                "text/html; charset=utf-8",
+                Cow::Owned(file_content.into_bytes()),
+            ),
+            Err(e) => e_to_cow(p, e),
+        },
         Some(ext) => build_response_other(ext, p),
         _ => {
-            // No extension or unhandled extension, default to 404 Not Found or a simple text response.
-            // For simplicity, let's treat it as a 404 for now.
             eprintln!("Unhandled path or file extension: {}", p.display());
-            let status_line = "HTTP/1.1 404 Not Found";
             let body = "File not found or unsupported type.";
-            let msg = format!(
-                "{status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            Cow::Owned(msg.into_bytes())
+            build_http_response(
+                Status::PageNotFound,
+                "text/plain; charset=utf-8",
+                Cow::Borrowed(body.as_bytes()),
+            )
         }
-    };
-    response
+    }
 }
 
 fn handle_connection(files: &Path, mut stream: TcpStream) {
