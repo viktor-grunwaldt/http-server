@@ -24,6 +24,9 @@ macro_rules! HTML_MOVED {() => (
     "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n<h1>{}</h1>\n<p>The document has moved <a href=\"{}\">here</a>.</p>\n</body>\n</html>"
 )}
 
+macro_rules! HTML_ERROR {() => (
+    "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n<h1>{}</h1>\n</body>\n</html>"
+)}
 fn build_http_response(
     status: Status,
     content_type: &str,
@@ -99,9 +102,51 @@ fn build_response_other(ext: &str, p: &Path) -> Cow<'static, [u8]> {
         Err(e) => e_to_cow(p, e),
     }
 }
+
+fn is_path_safe(base_dir: &Path, requested_resource: &str) -> bool {
+    let canonical_base_dir = match base_dir.canonicalize() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!(
+                "is_path_safe: Error canonicalizing base directory '{}': {}",
+                base_dir.display(),
+                e
+            );
+            return false;
+        }
+    };
+    let mut actual_target_path = canonical_base_dir.clone();
+    for component in PathBuf::from(requested_resource.trim_start_matches('/')).components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                actual_target_path.push(name);
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !actual_target_path.pop() {
+                    return false;
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return false;
+            }
+        }
+    }
+    actual_target_path.starts_with(&canonical_base_dir)
+}
+
 fn handle_request(mut p: PathBuf, resource: &str, url: String) -> Cow<'static, [u8]> {
-    p.push(resource.trim_start_matches("/"));
-    if p.is_dir() && resource.ends_with('/') {
+    let resource_stripped = resource.trim_start_matches("/");
+    if !is_path_safe(&p, resource_stripped) {
+        eprintln!("Illegal path detected: {}", resource);
+        return build_http_response(
+            Status::Forbidden,
+            CONTENT_TYPE_TEXT,
+            Cow::Borrowed(b"403 Forbidden: Illegal path."),
+        );
+    }
+    p.push(resource_stripped);
+    if p.is_dir() && resource_stripped.ends_with('/') {
         let redirect_url = format!("{}{}index.html", url, resource);
         #[cfg(debug_assertions)]
         println!("Redirecting to: {}", redirect_url);
