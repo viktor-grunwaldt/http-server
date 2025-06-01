@@ -13,6 +13,7 @@ enum Status {
     Forbidden,
     PageNotFound,
     InternalServerError,
+    NotImplemented,
 }
 const NOT_FOUND_BODY: &str = "File not found or unsupported type.";
 const CONTENT_TYPE_TEXT: &str = "text/plain; charset=utf-8";
@@ -26,7 +27,7 @@ macro_rules! HTML_MOVED {() => (
 fn build_http_response(
     status: Status,
     content_type: &str,
-    body: Cow<'static, [u8]>,
+    initial_body: Cow<'static, [u8]>,
 ) -> Cow<'static, [u8]> {
     #[rustfmt::skip]
     let (code, status_str) = match status {
@@ -35,30 +36,30 @@ fn build_http_response(
         Status::Forbidden           => (403, "Forbidden"),
         Status::PageNotFound        => (404, "Not Found"),
         Status::InternalServerError => (500, "Internal Server Error"),
+        Status::NotImplemented      => (501, "Not Implemented"),
     };
 
     let full_status_line = format!("HTTP/1.1 {} {}", code, status_str);
-    let len = body.len();
 
-    let mut headers = format!(
-        "Content-Type: {}\r\nContent-Length: {}\r\n\r\n",
-        content_type, len
-    );
-    let is_body_empty = body.is_empty();
-    let mut final_body = body;
+    let mut headers = String::new();
+    let mut final_body = initial_body;
+
     if let Status::MovedPermamently(url) = status {
-        if is_body_empty {
+        if final_body.is_empty() {
             let html = format!(HTML_MOVED!(), status_str, status_str, &url);
             final_body = Cow::Owned(html.into_bytes());
         }
         headers.push_str(&format!("Location: {}\r\n", url));
     }
 
-    let mut response_bytes =
-        Vec::with_capacity(full_status_line.len() + 2 + headers.len() + final_body.len());
+    headers.push_str(&format!("Content-Type: {}\r\n", content_type));
+    headers.push_str(&format!("Content-Length: {}\r\n", final_body.len()));
+
+    let mut response_bytes = vec![];
     response_bytes.extend_from_slice(full_status_line.as_bytes());
-    response_bytes.extend_from_slice(b"\r\n"); // CRLF after status line
+    response_bytes.extend_from_slice(b"\r\n");
     response_bytes.extend_from_slice(headers.as_bytes());
+    response_bytes.extend_from_slice(b"\r\n");
     response_bytes.extend_from_slice(&final_body);
 
     Cow::Owned(response_bytes)
@@ -87,12 +88,11 @@ fn build_response_other(ext: &str, p: &Path) -> Cow<'static, [u8]> {
         "css" => "text/css",
         "js" => "application/javascript",
         "txt" => CONTENT_TYPE_TEXT,
-        "bin" => "application/octet-stream", // Generic binary
-        _ => "application/octet-stream",     // Default for unknown
+        "bin" => "application/octet-stream",
+        _ => "application/octet-stream",
     };
 
     match fs::read(p) {
-        // Read file as bytes
         Ok(file_bytes) => {
             build_http_response(Status::Success, content_type, Cow::Owned(file_bytes))
         }
@@ -104,7 +104,7 @@ fn handle_request(mut p: PathBuf, resource: &str, url: String) -> Cow<'static, [
         let spare_slash = if resource.ends_with('/') { "" } else { "/" };
         let redirect_url = format!("{}{}{}index.html", url, resource, spare_slash);
         #[cfg(debug_assertions)]
-        println!("{}", redirect_url);
+        println!("Redirecting to: {}", redirect_url);
         return build_http_response(
             Status::MovedPermamently(redirect_url),
             CONTENT_TYPE_TEXT,
@@ -144,8 +144,12 @@ fn parse_host_address(host_str: &str) -> Option<&str> {
 fn handle_connection(resource_dir: &Path, mut stream: TcpStream, addr: SocketAddrV4) {
     let mut rdr = std::io::BufReader::new(&mut stream);
     let mut l = String::new();
-    rdr.read_line(&mut l).unwrap();
-    match l.trim().split(' ').collect::<Vec<_>>().as_slice() {
+    if rdr.read_line(&mut l).is_err() || l.is_empty() {
+        eprintln!("Failed to read request line or empty request.");
+        return;
+    }
+
+    let response = match l.trim().split(' ').collect::<Vec<_>>().as_slice() {
         ["GET", resource, "HTTP/1.1"] => {
             let remainder = rdr
                 .lines()
@@ -153,10 +157,11 @@ fn handle_connection(resource_dir: &Path, mut stream: TcpStream, addr: SocketAdd
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
             #[cfg(debug_assertions)]
-            println!("{:?}", remainder);
+            println!("Headers: {:?}", remainder);
+
             let domain_name = remainder
-                .get(0)
-                .and_then(|x| parse_host_address(x.as_str()))
+                .iter()
+                .find_map(|x| parse_host_address(x.as_str()))
                 .expect("couldn't parse or find the Host header");
             let mut p = std::path::PathBuf::new();
             p.push(&resource_dir);
@@ -164,10 +169,20 @@ fn handle_connection(resource_dir: &Path, mut stream: TcpStream, addr: SocketAdd
                 p.push(domain_name);
             }
             let url = format!("http://{domain_name}:{}", addr.port());
-            let response = handle_request(p, resource, url);
-            stream.write_all(&response).unwrap();
+            handle_request(p, resource, url)
         }
-        _ => todo!(),
+        _ => {
+            eprintln!("Unsupported or malformed request: {}", l.trim());
+            build_http_response(
+                Status::NotImplemented,
+                CONTENT_TYPE_TEXT,
+                Cow::Borrowed(b"501 Not Implemented or Bad Request"),
+            )
+        }
+    };
+
+    if let Err(e) = stream.write_all(&response) {
+        eprintln!("Failed to write response to stream: {}", e);
     }
 }
 struct ProgArgs {
@@ -191,9 +206,22 @@ fn main() {
 
     let saddr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 1, 1), args.port);
     println!("listening on address: http://{}", saddr);
-    let listener = std::net::TcpListener::bind(saddr).unwrap();
-    listener
-        .incoming()
-        .flatten()
-        .for_each(|s| handle_connection(&args.directory, s, saddr));
+    let listener = match std::net::TcpListener::bind(saddr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Failed to bind to address {}: {}", saddr, e);
+            std::process::exit(1);
+        }
+    };
+
+    for stream_result in listener.incoming() {
+        match stream_result {
+            Ok(stream) => {
+                handle_connection(&args.directory, stream, saddr);
+            }
+            Err(e) => {
+                eprintln!("Error accepting connection: {}", e);
+            }
+        }
+    }
 }
