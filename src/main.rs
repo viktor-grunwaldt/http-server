@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone)]
 enum Status {
     Success,
     MovedPermamently(String),
@@ -16,7 +17,6 @@ enum Status {
     NotImplemented,
 }
 const NOT_FOUND_BODY: &str = "File not found or unsupported type.";
-const CONTENT_TYPE_TEXT: &str = "text/plain; charset=utf-8";
 
 // as I'm using the format! macro, the format literal needs to be known at compile time
 // https://github.com/rust-lang/rust/issues/69133
@@ -25,23 +25,35 @@ macro_rules! HTML_MOVED {() => (
 )}
 
 macro_rules! HTML_ERROR {() => (
-    "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n<h1>{}</h1>\n</body>\n</html>"
+    "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>{0}</title></head>\n<body>\n<h1>{0}</h1>\n</body>\n</html>"
 )}
-fn build_http_response(
-    status: Status,
-    content_type: &str,
-    initial_body: Cow<'static, [u8]>,
-) -> Cow<'static, [u8]> {
-    #[rustfmt::skip]
-    let (code, status_str) = match status {
+
+#[rustfmt::skip]
+fn from_status(s: Status) -> (u16, &'static str) {
+    match s {
         Status::Success             => (200, "OK"),
         Status::MovedPermamently(_) => (301, "Moved Permamently"),
         Status::Forbidden           => (403, "Forbidden"),
         Status::PageNotFound        => (404, "Not Found"),
         Status::InternalServerError => (500, "Internal Server Error"),
         Status::NotImplemented      => (501, "Not Implemented"),
-    };
+    }
+}
 
+fn build_error_response(status: Status) -> Cow<'static, [u8]> {
+    let body = format!(HTML_ERROR!(), from_status(status.clone()).1,);
+    build_http_response(
+        status,
+        "text/html; charset=utf-8",
+        Cow::Owned(body.into_bytes()),
+    )
+}
+fn build_http_response(
+    status: Status,
+    content_type: &str,
+    initial_body: Cow<'static, [u8]>,
+) -> Cow<'static, [u8]> {
+    let (code, status_str) = from_status(status.clone());
     let full_status_line = format!("HTTP/1.1 {} {}", code, status_str);
 
     let mut headers = String::new();
@@ -70,12 +82,7 @@ fn build_http_response(
 
 fn e_to_cow(p: &Path, e: std::io::Error) -> Cow<'static, [u8]> {
     eprintln!("Error reading file {}: {}", p.display(), e);
-    let body = format!("Server error: {}", e);
-    build_http_response(
-        Status::InternalServerError,
-        CONTENT_TYPE_TEXT,
-        Cow::Owned(body.into_bytes()),
-    )
+    build_error_response(Status::InternalServerError)
 }
 
 fn build_response_other(ext: &str, p: &Path) -> Cow<'static, [u8]> {
@@ -90,7 +97,7 @@ fn build_response_other(ext: &str, p: &Path) -> Cow<'static, [u8]> {
         "xml" => "application/xml",
         "css" => "text/css",
         "js" => "application/javascript",
-        "txt" => CONTENT_TYPE_TEXT,
+        "txt" => "text/plain; charset=utf-8",
         "bin" => "application/octet-stream",
         _ => "application/octet-stream",
     };
@@ -139,11 +146,7 @@ fn handle_request(mut p: PathBuf, resource: &str, url: String) -> Cow<'static, [
     let resource_stripped = resource.trim_start_matches("/");
     if !is_path_safe(&p, resource_stripped) {
         eprintln!("Illegal path detected: {}", resource);
-        return build_http_response(
-            Status::Forbidden,
-            CONTENT_TYPE_TEXT,
-            Cow::Borrowed(b"403 Forbidden: Illegal path."),
-        );
+        return build_error_response(Status::Forbidden);
     }
     p.push(resource_stripped);
     if p.is_dir() && resource_stripped.ends_with('/') {
@@ -152,7 +155,7 @@ fn handle_request(mut p: PathBuf, resource: &str, url: String) -> Cow<'static, [
         println!("Redirecting to: {}", redirect_url);
         return build_http_response(
             Status::MovedPermamently(redirect_url),
-            CONTENT_TYPE_TEXT,
+            "text/html; charset=utf-8",
             Cow::Owned(vec![]),
         );
     }
@@ -168,11 +171,7 @@ fn handle_request(mut p: PathBuf, resource: &str, url: String) -> Cow<'static, [
         Some(ext) => build_response_other(ext, &p),
         _ => {
             eprintln!("Unhandled path or file extension: {}", p.display());
-            build_http_response(
-                Status::PageNotFound,
-                CONTENT_TYPE_TEXT,
-                Cow::Borrowed(NOT_FOUND_BODY.as_bytes()),
-            )
+            build_error_response(Status::PageNotFound)
         }
     }
 }
@@ -192,18 +191,24 @@ fn handle_connection(resource_dir: &Path, mut stream: TcpStream, addr: SocketAdd
         eprintln!("Failed to read request line or empty request.");
         return;
     }
+    let headers = rdr
+        .lines()
+        .take_while(|x| x.as_ref().map(|l| !l.is_empty()).unwrap_or(true))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
-    let response = match l.trim().split(' ').collect::<Vec<_>>().as_slice() {
+    #[cfg(debug_assertions)]
+    println!("Headers: {:#?}", headers);
+    let response = match headers
+        .first()
+        .unwrap()
+        .trim()
+        .split(' ')
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["GET", resource, "HTTP/1.1"] => {
-            let remainder = rdr
-                .lines()
-                .take_while(|x| x.as_ref().map(|l| !l.is_empty()).unwrap_or(true))
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            #[cfg(debug_assertions)]
-            println!("Headers: {:#?}", remainder);
-
-            let domain_name = remainder
+            let domain_name = headers
                 .iter()
                 .find_map(|x| parse_host_address(x.as_str()))
                 .expect("couldn't parse or find the Host header");
@@ -217,11 +222,7 @@ fn handle_connection(resource_dir: &Path, mut stream: TcpStream, addr: SocketAdd
         }
         _ => {
             eprintln!("Unsupported or malformed request: {}", l.trim());
-            build_http_response(
-                Status::NotImplemented,
-                CONTENT_TYPE_TEXT,
-                Cow::Borrowed(b"501 Not Implemented or Bad Request"),
-            )
+            build_error_response(Status::NotImplemented)
         }
     };
 
