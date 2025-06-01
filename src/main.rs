@@ -2,21 +2,22 @@ use std::{
     borrow::Cow,
     env::{self, Args},
     fs,
-    io::{BufRead, Write},
+    io::{self, BufRead, BufReader, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpStream},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 #[derive(Clone)]
 enum Status {
     Success,
     MovedPermamently(String),
+    BadRequest,
     Forbidden,
     PageNotFound,
     InternalServerError,
     NotImplemented,
 }
-const NOT_FOUND_BODY: &str = "File not found or unsupported type.";
 
 // as I'm using the format! macro, the format literal needs to be known at compile time
 // https://github.com/rust-lang/rust/issues/69133
@@ -33,6 +34,7 @@ fn from_status(s: Status) -> (u16, &'static str) {
     match s {
         Status::Success             => (200, "OK"),
         Status::MovedPermamently(_) => (301, "Moved Permamently"),
+        Status::BadRequest          => (400, "Bad Request"),
         Status::Forbidden           => (403, "Forbidden"),
         Status::PageNotFound        => (404, "Not Found"),
         Status::InternalServerError => (500, "Internal Server Error"),
@@ -184,52 +186,164 @@ fn parse_host_address(host_str: &str) -> Option<&str> {
         .map(|x| x.split_once(':').map_or(x, |(name, _port)| name))
 }
 
+const KEEP_ALIVE_TIMEOUT_MS: u64 = 1000;
+const MAX_REQUESTS_PER_CONNECTION: u32 = 100;
+
 fn handle_connection(resource_dir: &Path, mut stream: TcpStream, addr: SocketAddrV4) {
-    let mut rdr = std::io::BufReader::new(&mut stream);
-    let mut l = String::new();
-    if rdr.read_line(&mut l).is_err() || l.is_empty() {
-        eprintln!("Failed to read request line or empty request.");
-        return;
+    let mut requests_served = 0;
+    let timeout_dur = Some(Duration::from_millis(KEEP_ALIVE_TIMEOUT_MS));
+    loop {
+        if requests_served >= MAX_REQUESTS_PER_CONNECTION {
+            #[cfg(debug_assertions)]
+            println!("Max requests per connection reached. Closing.");
+            break;
+        }
+
+        if let Err(e) = stream.set_read_timeout(timeout_dur) {
+            eprintln!("Failed to set read timeout: {}. Closing connection.", e);
+            break;
+        }
+
+        let mut rdr = BufReader::new(&mut stream);
+        let mut request_line_str = String::new();
+
+        match rdr.read_line(&mut request_line_str) {
+            Ok(0) => {
+                #[cfg(debug_assertions)]
+                println!("Client closed connection (EOF).");
+                break;
+            }
+            Ok(_) => {
+                if request_line_str.trim().is_empty() {
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "Received empty request line, possibly after previous request. Closing."
+                    );
+                    break;
+                }
+            }
+            Err(e) => {
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut {
+                    #[cfg(debug_assertions)]
+                    println!("Connection timed out due to inactivity.");
+                } else {
+                    eprintln!("Failed to read request line: {}. Closing connection.", e);
+                }
+                break;
+            }
+        }
+
+        let mut actual_headers = Vec::new();
+        loop {
+            let mut header_line = String::new();
+            match rdr.read_line(&mut header_line) {
+                Ok(0) => {
+                    break;
+                }
+                Ok(_) => {
+                    let trimmed = header_line.trim();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    actual_headers.push(trimmed.to_string());
+                }
+                Err(e) => {
+                    eprintln!("Error reading headers: {}. Closing connection.", e);
+                    stream.shutdown(std::net::Shutdown::Both).ok();
+                    return;
+                }
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        println!("--- New Request ---");
+        #[cfg(debug_assertions)]
+        println!("Request Line: {}", request_line_str.trim());
+        #[cfg(debug_assertions)]
+        println!("Headers: {:#?}", actual_headers);
+
+        let mut client_wants_close = false;
+        for header in &actual_headers {
+            if header.eq_ignore_ascii_case("Connection: close") {
+                client_wants_close = true;
+                break;
+            }
+        }
+
+        let response_cow = match request_line_str
+            .trim()
+            .split(' ')
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            ["GET", resource, "HTTP/1.1"] => {
+                let domain_name_option = actual_headers
+                    .iter()
+                    .find_map(|h_str| parse_host_address(h_str.as_str()));
+
+                match domain_name_option {
+                    Some(domain_name) => {
+                        let mut p = PathBuf::new();
+                        p.push(resource_dir);
+                        if env::var("HOST_NOT_DEFINED").unwrap_or_default() != "1" {
+                            p.push(domain_name);
+                        }
+                        let url_base = format!("http://{}:{}", domain_name, addr.port());
+                        handle_request(p, resource, url_base)
+                    }
+                    None => {
+                        eprintln!("Host header not found or unparseable.");
+                        build_error_response(Status::BadRequest)
+                    }
+                }
+            }
+            _ => {
+                eprintln!(
+                    "Unsupported or malformed request: {}",
+                    request_line_str.trim()
+                );
+                build_error_response(Status::NotImplemented)
+            }
+        };
+
+        if let Err(e) = stream.write_all(&response_cow) {
+            eprintln!(
+                "Failed to write response to stream: {}. Closing connection.",
+                e
+            );
+            break; // Stop if we can't write
+        }
+        if let Err(e) = stream.flush() {
+            // Ensure all data is sent
+            eprintln!("Failed to flush stream: {}. Closing connection.", e);
+            break;
+        }
+
+        requests_served += 1;
+
+        if client_wants_close {
+            #[cfg(debug_assertions)]
+            println!("Client requested Connection: close.");
+            break;
+        }
+
+        #[cfg(debug_assertions)]
+        println!("Keeping connection alive for next request.");
     }
-    let headers = rdr
-        .lines()
-        .take_while(|x| x.as_ref().map(|l| !l.is_empty()).unwrap_or(true))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
 
     #[cfg(debug_assertions)]
-    println!("Headers: {:#?}", headers);
-    let response = match headers
-        .first()
-        .unwrap()
-        .trim()
-        .split(' ')
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        ["GET", resource, "HTTP/1.1"] => {
-            let domain_name = headers
-                .iter()
-                .find_map(|x| parse_host_address(x.as_str()))
-                .expect("couldn't parse or find the Host header");
-            let mut p = std::path::PathBuf::new();
-            p.push(&resource_dir);
-            if env::var("HOST_NOT_DEFINED").unwrap_or_default() != "1" {
-                p.push(domain_name);
-            }
-            let url = format!("http://{domain_name}:{}", addr.port());
-            handle_request(p, resource, url)
-        }
-        _ => {
-            eprintln!("Unsupported or malformed request: {}", l.trim());
-            build_error_response(Status::NotImplemented)
-        }
-    };
+    println!(
+        "Connection with {} closed after {} requests.",
+        addr, requests_served
+    );
 
-    if let Err(e) = stream.write_all(&response) {
-        eprintln!("Failed to write response to stream: {}", e);
-    }
+    stream
+        .shutdown(std::net::Shutdown::Both)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to shutdown stream: {}", e);
+        });
 }
+
 struct ProgArgs {
     port: u16,
     directory: PathBuf,
