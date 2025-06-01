@@ -100,9 +100,9 @@ fn build_response_other(ext: &str, p: &Path) -> Cow<'static, [u8]> {
     }
 }
 fn handle_request(mut p: PathBuf, resource: &str, url: String) -> Cow<'static, [u8]> {
-    if p.is_dir() {
-        let spare_slash = if resource.ends_with('/') { "" } else { "/" };
-        let redirect_url = format!("{}{}{}index.html", url, resource, spare_slash);
+    p.push(resource.trim_start_matches("/"));
+    if p.is_dir() && resource.ends_with('/') {
+        let redirect_url = format!("{}{}index.html", url, resource);
         #[cfg(debug_assertions)]
         println!("Redirecting to: {}", redirect_url);
         return build_http_response(
@@ -111,7 +111,6 @@ fn handle_request(mut p: PathBuf, resource: &str, url: String) -> Cow<'static, [
             Cow::Owned(vec![]),
         );
     }
-    p.push(resource.trim_start_matches("/"));
     match p.extension().and_then(|ext| ext.to_str()) {
         Some("html") => match fs::read_to_string(&p) {
             Ok(file_content) => build_http_response(
@@ -157,7 +156,7 @@ fn handle_connection(resource_dir: &Path, mut stream: TcpStream, addr: SocketAdd
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
             #[cfg(debug_assertions)]
-            println!("Headers: {:?}", remainder);
+            println!("Headers: {:#?}", remainder);
 
             let domain_name = remainder
                 .iter()
