@@ -172,7 +172,13 @@ fn handle_request(mut p: PathBuf, resource: &str, url: String) -> Cow<'static, [
                 "text/html; charset=utf-8",
                 Cow::Owned(file_content.into_bytes()),
             ),
-            Err(e) => e_to_cow(&p, e),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                build_error_response(Status::PageNotFound)
+            }
+            Err(e) => {
+                eprintln!("Read to string failed with error: {}", e);
+                e_to_cow(&p, e)
+            }
         },
         Some(ext) => build_response_other(ext, &p),
         _ => {
