@@ -199,9 +199,109 @@ fn parse_host_address(host_str: &str) -> Option<&str> {
 const KEEP_ALIVE_TIMEOUT_MS: u64 = 1000;
 const MAX_REQUESTS_PER_CONNECTION: u32 = 100;
 
+enum ReadRequestInitialError {
+    Io(io::Error),
+    Timeout,
+    ClientClosed,
+    EmptyRequest,
+    HeaderReadIo(io::Error),
+}
+
+fn read_request_line_and_headers(
+    rdr: &mut BufReader<&mut TcpStream>,
+) -> Result<(String, Vec<String>), ReadRequestInitialError> {
+    let mut request_line_str = String::new();
+    match rdr.read_line(&mut request_line_str) {
+        Ok(0) => return Err(ReadRequestInitialError::ClientClosed),
+        Ok(_) => {
+            if request_line_str.trim().is_empty() {
+                return Err(ReadRequestInitialError::EmptyRequest);
+            }
+        }
+        Err(e) => {
+            return if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut {
+                Err(ReadRequestInitialError::Timeout)
+            } else {
+                Err(ReadRequestInitialError::Io(e))
+            };
+        }
+    }
+
+    let mut actual_headers = Vec::new();
+    loop {
+        let mut header_line = String::new();
+        match rdr.read_line(&mut header_line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = header_line.trim();
+                if trimmed.is_empty() {
+                    break;
+                }
+                actual_headers.push(trimmed.to_string());
+            }
+            Err(e) => return Err(ReadRequestInitialError::HeaderReadIo(e)),
+        }
+    }
+    Ok((request_line_str, actual_headers))
+}
+
+fn determine_http_response(
+    request_line_str: &str,
+    actual_headers: &[String],
+    resource_dir: &Path,
+    server_listening_addr: SocketAddrV4,
+) -> Cow<'static, [u8]> {
+    match request_line_str
+        .trim()
+        .split(' ')
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["GET", resource, "HTTP/1.1"] => {
+            let domain_name_option = actual_headers
+                .iter()
+                .find_map(|h_str| parse_host_address(h_str.as_str()));
+
+            match domain_name_option {
+                Some(domain_name) => {
+                    let mut p = PathBuf::new();
+                    p.push(resource_dir);
+                    if env::var("HOST_NOT_DEFINED").unwrap_or_default() != "1" {
+                        p.push(domain_name);
+                    }
+                    let url_base =
+                        format!("http://{}:{}", domain_name, server_listening_addr.port());
+                    handle_request(p, resource, url_base)
+                }
+                None => {
+                    eprintln!("Host header not found or unparseable.");
+                    build_error_response(Status::BadRequest)
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "Unsupported or malformed request: {}",
+                request_line_str.trim()
+            );
+            build_error_response(Status::NotImplemented)
+        }
+    }
+}
+
+fn write_response_to_stream(
+    stream: &mut TcpStream,
+    response_cow: &Cow<'static, [u8]>,
+) -> Result<(), io::Error> {
+    stream.write_all(response_cow)?;
+    stream.flush()?;
+    Ok(())
+}
+
 fn handle_connection(resource_dir: &Path, mut stream: TcpStream, addr: SocketAddrV4) {
     let mut requests_served = 0;
-    let timeout_dur = Some(Duration::from_millis(KEEP_ALIVE_TIMEOUT_MS));
+    let timeout_duration = Some(Duration::from_millis(KEEP_ALIVE_TIMEOUT_MS));
+
     loop {
         if requests_served >= MAX_REQUESTS_PER_CONNECTION {
             #[cfg(debug_assertions)]
@@ -209,129 +309,64 @@ fn handle_connection(resource_dir: &Path, mut stream: TcpStream, addr: SocketAdd
             break;
         }
 
-        if let Err(e) = stream.set_read_timeout(timeout_dur) {
+        if let Err(e) = stream.set_read_timeout(timeout_duration) {
             eprintln!("Failed to set read timeout: {}. Closing connection.", e);
             break;
         }
 
         let mut rdr = BufReader::new(&mut stream);
-        let mut request_line_str = String::new();
-
-        match rdr.read_line(&mut request_line_str) {
-            Ok(0) => {
+        let (request_line_str, actual_headers) = match read_request_line_and_headers(&mut rdr) {
+            Ok(parts) => parts,
+            Err(ReadRequestInitialError::ClientClosed) => {
                 #[cfg(debug_assertions)]
                 println!("Client closed connection (EOF).");
                 break;
             }
-            Ok(_) => {
-                if request_line_str.trim().is_empty() {
-                    #[cfg(debug_assertions)]
-                    println!(
-                        "Received empty request line, possibly after previous request. Closing."
-                    );
-                    break;
-                }
-            }
-            Err(e) => {
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut {
-                    #[cfg(debug_assertions)]
-                    println!("Connection timed out due to inactivity.");
-                } else {
-                    eprintln!("Failed to read request line: {}. Closing connection.", e);
-                }
+            Err(ReadRequestInitialError::EmptyRequest) => {
+                #[cfg(debug_assertions)]
+                println!("Received empty request line. Closing.");
                 break;
             }
-        }
-
-        let mut actual_headers = Vec::new();
-        loop {
-            let mut header_line = String::new();
-            match rdr.read_line(&mut header_line) {
-                Ok(0) => {
-                    break;
-                }
-                Ok(_) => {
-                    let trimmed = header_line.trim();
-                    if trimmed.is_empty() {
-                        break;
-                    }
-                    actual_headers.push(trimmed.to_string());
-                }
-                Err(e) => {
-                    eprintln!("Error reading headers: {}. Closing connection.", e);
-                    stream.shutdown(std::net::Shutdown::Both).ok();
-                    return;
-                }
-            }
-        }
-
-        #[cfg(debug_assertions)]
-        println!("--- New Request ---");
-        #[cfg(debug_assertions)]
-        println!("Request Line: {}", request_line_str.trim());
-        #[cfg(debug_assertions)]
-        println!("Headers: {:#?}", actual_headers);
-
-        let mut client_wants_close = false;
-        for header in &actual_headers {
-            if header.eq_ignore_ascii_case("Connection: close") {
-                client_wants_close = true;
+            Err(ReadRequestInitialError::Timeout) => {
+                #[cfg(debug_assertions)]
+                println!("Connection timed out due to inactivity.");
                 break;
             }
-        }
-
-        let response_cow = match request_line_str
-            .trim()
-            .split(' ')
-            .collect::<Vec<_>>()
-            .as_slice()
-        {
-            ["GET", resource, "HTTP/1.1"] => {
-                let domain_name_option = actual_headers
-                    .iter()
-                    .find_map(|h_str| parse_host_address(h_str.as_str()));
-
-                match domain_name_option {
-                    Some(domain_name) => {
-                        let mut p = PathBuf::new();
-                        p.push(resource_dir);
-                        if env::var("HOST_NOT_DEFINED").unwrap_or_default() != "1" {
-                            p.push(domain_name);
-                        }
-                        let url_base = format!("http://{}:{}", domain_name, addr.port());
-                        handle_request(p, resource, url_base)
-                    }
-                    None => {
-                        eprintln!("Host header not found or unparseable.");
-                        build_error_response(Status::BadRequest)
-                    }
-                }
+            Err(ReadRequestInitialError::Io(e)) => {
+                eprintln!("Failed to read request line: {}. Closing connection.", e);
+                break;
             }
-            _ => {
-                eprintln!(
-                    "Unsupported or malformed request: {}",
-                    request_line_str.trim()
-                );
-                build_error_response(Status::NotImplemented)
+            Err(ReadRequestInitialError::HeaderReadIo(e)) => {
+                eprintln!("Error reading headers: {}. Closing connection.", e);
+                stream.shutdown(std::net::Shutdown::Both).ok();
+                return;
             }
         };
 
-        if let Err(e) = stream.write_all(&response_cow) {
+        #[cfg(debug_assertions)]
+        {
+            println!("--- New Request ---");
+            println!("Request Line: {}", request_line_str.trim());
+            println!("Headers: {:#?}", actual_headers);
+        }
+
+        let wants_close = actual_headers
+            .iter()
+            .any(|header| header.eq_ignore_ascii_case("Connection: close"));
+        let response_cow =
+            determine_http_response(&request_line_str, &actual_headers, resource_dir, addr);
+
+        if let Err(e) = write_response_to_stream(&mut stream, &response_cow) {
             eprintln!(
                 "Failed to write response to stream: {}. Closing connection.",
                 e
             );
-            break; // Stop if we can't write
-        }
-        if let Err(e) = stream.flush() {
-            // Ensure all data is sent
-            eprintln!("Failed to flush stream: {}. Closing connection.", e);
             break;
         }
 
         requests_served += 1;
 
-        if client_wants_close {
+        if wants_close {
             #[cfg(debug_assertions)]
             println!("Client requested Connection: close.");
             break;
