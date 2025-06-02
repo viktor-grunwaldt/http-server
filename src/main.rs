@@ -151,8 +151,12 @@ fn handle_request(mut p: PathBuf, resource: &str, url: String) -> Cow<'static, [
         return build_error_response(Status::Forbidden);
     }
     p.push(resource_stripped);
-    if p.is_dir() && resource_stripped.ends_with('/') {
-        let redirect_url = format!("{}{}index.html", url, resource);
+    if p.is_dir() {
+        let mut resource_formatted = resource.to_string();
+        if !resource_formatted.ends_with('/') {
+            resource_formatted.push('/');
+        }
+        let redirect_url = format!("{}{}index.html", url, resource_formatted);
         #[cfg(debug_assertions)]
         println!("Redirecting to: {}", redirect_url);
         return build_http_response(
